@@ -137,6 +137,10 @@ static int g_tiers[8], g_numTiers;   // weapons from weakest to strongest in thi
 static int g_tier = -1;
 static int g_lastSwitchTic = -1000;
 
+// Pedalling hard enough for the rocket launcher (or a stronger weapon) also gives god mode, and
+// splash damage no longer matters: rockets fly at anything and barrels are fair game.
+static int g_bikeGod;              // god mode given by the bike (not by IDDQD); game thread
+
 // Episode totals (game thread)
 static ridestats_t g_stats;
 static float g_statsResistanceSum;   // resistance times seconds pedalling
@@ -2462,6 +2466,8 @@ static float BlastDistance(mobj_t* spot, mobj_t* victim)
 // *hurts.
 static int BarrelDanger(mobj_t* mo, float dirX, float dirY, int weapon, mobj_t** lit, mobj_t** hurts)
 {
+    if (g_bikeGod)
+        return 0;   // a blast can't hurt us
     if (!g_numBarrels)
         return 0;
     float half, width, range;
@@ -2917,6 +2923,8 @@ static void BuildTiers(void)
 // that could step into the shot. margin widens both distances.
 static int RocketSafe(mobj_t* mo, float margin)
 {
+    if (g_bikeGod)
+        return 1;   // the splash can't hurt us
     if (g_target)
     {
         float dx = (g_target->x - mo->x) / (float)FRACUNIT, dy = (g_target->y - mo->y) / (float)FRACUNIT;
@@ -2937,6 +2945,24 @@ static int RocketSafe(mobj_t* mo, float margin)
     return 1;
 }
 
+static void SetBikeGod(player_t* player, int on)
+{
+    if (on && !g_bikeGod && !(player->cheats & CF_GODMODE))
+    {
+        player->cheats |= CF_GODMODE;
+        g_bikeGod = 1;
+        LOGI("Ride: rocket power; god mode on");
+    }
+    else if (on && g_bikeGod)
+        player->cheats |= CF_GODMODE;   // E1M8's last room takes it away each tic: give it back
+    else if (!on && g_bikeGod)
+    {
+        player->cheats &= ~CF_GODMODE;
+        g_bikeGod = 0;
+        LOGI("Ride: below rocket power; god mode off");
+    }
+}
+
 static void ChooseWeapon(player_t* player)
 {
     if (!g_numTiers)
@@ -2951,6 +2977,11 @@ static void ChooseWeapon(player_t* player)
     g_tier = tier;
 
     int weapon = g_tiers[tier];
+    // Rocket power or more: god mode too, on while the tier holds (IDDQD typed by hand is left alone).
+    int godTier = 0;
+    while (godTier < g_numTiers - 1 && g_tiers[godTier] != wp_missile)
+        godTier++;
+    SetBikeGod(player, tier >= godTier);
     // Coming back to rockets needs a little more room than leaving them, so it doesn't flap.
     if (weapon == wp_missile &&
         !RocketSafe(player->mo, player->readyweapon == wp_missile ? 0 : ROCKET_RETURN))
@@ -3135,7 +3166,10 @@ void RIDE_BuildTiccmd(ticcmd_t* cmd)
         g_builtLevel = g_level;
     }
     if (!enabled)
+    {
+        SetBikeGod(player, 0);   // free mode: no god mode from the bike
         return;
+    }
 
     if (player->playerstate == PST_DEAD)
     {
