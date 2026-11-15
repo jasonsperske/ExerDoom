@@ -166,7 +166,7 @@ Changes to the engine sources in `linuxdoom-1.10/`:
 - **ARM:** built with `-fsigned-char`, because `ticcmd_t`'s movement fields are plain `char`.
 - **Bionic:** no `<values.h>`; `boolean` coexists with `<stdbool.h>`.
 - **Touch (`__ANDROID__` only):** Quit Game quits at once, with no "press y" prompt; Enter answers "yes" in other prompts; an empty save slot gets a default name, the tic loop sleeps instead of spinning, and 8 sound channels by default.
-- **Ride mode (`__ANDROID__` only):** `G_BuildTiccmd` hands the ticcmd to `RIDE_BuildTiccmd` and `P_SetupLevel` calls `RIDE_LevelLoaded`, and `vissprite_t` records its `mobj` so a touch can find the monster under it. `G_InitNew` and `G_DoCompleted` call `RIDE_NewGame` and `RIDE_LevelCompleted` for the episode totals. `F_Ticker` and `F_Drawer` show the totals (finale stage 3) between the closing text and the end picture, and `WI_updateStats` moves on by itself after 8 seconds.
+- **Ride mode (`__ANDROID__` only):** `G_Ticker` hands the console player's ticcmd to `RIDE_BuildTiccmd` just before running each tic (not `G_BuildTiccmd`, which `NetUpdate` calls on wall-clock time, also mid-frame from the renderer) and `P_SetupLevel` calls `RIDE_LevelLoaded`, and `vissprite_t` records its `mobj` so a touch can find the monster under it. `G_InitNew` and `G_DoCompleted` call `RIDE_NewGame` and `RIDE_LevelCompleted` for the episode totals. `F_Ticker` and `F_Drawer` show the totals (finale stage 3) between the closing text and the end picture, and `WI_updateStats` moves on by itself after 8 seconds.
 
 ## Bike library
 

@@ -422,14 +422,6 @@ void G_BuildTiccmd (ticcmd_t* cmd)
     cmd->forwardmove += forward; 
     cmd->sidemove += side;
 
-#ifdef __ANDROID__
-    // Ride mode (android/app/src/main/cpp/ride.c) steers along the level's route.
-    {
-	extern void RIDE_BuildTiccmd (ticcmd_t* cmd);
-	RIDE_BuildTiccmd (cmd);
-    }
-#endif
-    
     // special buttons
     if (sendpause) 
     { 
@@ -669,6 +661,23 @@ void G_Ticker (void)
 	{ 
 	    cmd = &players[i].cmd; 
  
+#ifdef __ANDROID__
+	    // Ride mode (android/app/src/main/cpp/ride.c) steers along the level's route.
+	    // It runs here, once per tic against the state that tic starts from, and not in
+	    // G_BuildTiccmd: NetUpdate builds ticcmds whenever wall-clock tics have passed
+	    // (also mid-frame, from the renderer), several ahead of the game when it is behind.
+	    // A pause or save request keeps its buttons.
+	    if (i == consoleplayer && !demoplayback)
+	    {
+		extern void RIDE_BuildTiccmd (ticcmd_t* cmd);
+		ticcmd_t* ncmd = &netcmds[i][buf];
+		byte buttons = ncmd->buttons;
+		RIDE_BuildTiccmd (ncmd);
+		if (buttons & BT_SPECIAL)
+		    ncmd->buttons = buttons;
+	    }
+#endif
+
 	    memcpy (cmd, &netcmds[i][buf], sizeof(ticcmd_t)); 
  
 	    if (demoplayback) 
