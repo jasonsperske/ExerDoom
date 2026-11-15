@@ -114,6 +114,8 @@ extern int viewwindowx, viewwindowy;
 #define SUIT_LOW        (4*TICRATE)   // on damaging floor with less than this left of a radiation suit ...
 #define SUIT_MAX        1536.0f // ... ride to a suit this near (route cost, damaging floor counted heavier)
 #define SUIT_RECHECK    (2*TICRATE)   // look for one this often while on damaging floor
+#define HEALTH_LOW      80      // below this much health, ride to a stimpack, medikit or soulsphere
+#define HEALTH_RECHECK  (2*TICRATE)   // look for one this often while health is low
 
 // ---------------------------------------------------------------------------
 // Inputs from the UI thread
@@ -253,19 +255,19 @@ static int g_level;          // bumped by RIDE_LevelLoaded so the game thread re
 static int g_builtLevel = -1;
 
 // The tour (per level, kept across grid rebuilds)
-enum { OBJ_NONE, OBJ_KEY, OBJ_LINE, OBJ_EXIT, OBJ_BOSS, OBJ_DETOUR, OBJ_SUIT };
+enum { OBJ_NONE, OBJ_KEY, OBJ_LINE, OBJ_EXIT, OBJ_BOSS, OBJ_DETOUR, OBJ_SUIT, OBJ_HEALTH };
 #define LINE_DONE      1
 #define LINE_ABANDONED 2
 static byte* g_lineState;    // per line: LINE_DONE once triggered, LINE_ABANDONED if unreachable
 static int g_linesDone;      // count of LINE_DONE, to know when the grid is out of date
-static mobj_t* g_abandonedKeys[16];
+static mobj_t* g_abandonedKeys[32];
 static int g_numAbandonedKeys;
 static int g_magic;          // fallback: open and move everything on the route regardless
 static int g_preferSecret;   // this map's secret exit leads to a level not otherwise played
 static int g_gridKeys = -1, g_gridLines = -1, g_gridMagic = -1;   // state the grid was built for
 static int g_objKind;        // what the current route is heading for
 static int g_objLine = -1;   // OBJ_LINE: the line
-static mobj_t* g_objKey;     // OBJ_KEY: the key; OBJ_SUIT: the radiation suit
+static mobj_t* g_objKey;     // OBJ_KEY: the key; OBJ_SUIT, OBJ_HEALTH: the item
 static int g_objColor;       // OBJ_KEY: its colour
 static int g_objExitFlag;    // OBJ_EXIT: CF_GOAL or CF_GOAL2
 static int g_objStucks;      // times stuck while heading for this objective
@@ -273,9 +275,11 @@ static int g_objArrivedTic = -1;   // reached the end of the route without compl
 static int g_detourUntil;    // OBJ_DETOUR: when to stop and plan again
 static int g_savedKind, g_savedLine, g_savedColor;   // the objective a detour interrupted
 static mobj_t* g_savedKey;
-static int g_suitResumeKind, g_suitResumeLine, g_suitResumeColor, g_suitResumeStucks;   // the objective
-static mobj_t* g_suitResumeKey;                                   // a radiation suit interrupted
+static int g_pickupResumeKind, g_pickupResumeLine, g_pickupResumeColor, g_pickupResumeStucks;   // the objective
+static mobj_t* g_pickupResumeKey;                                 // a suit or health item interrupted
 static int g_suitCheckTic;   // next look for a radiation suit while on damaging floor
+static int g_healthCheckTic; // next look for health while health is low
+static int g_lowHealthReplanned;   // health went low and the tour was planned again for it
 static unsigned g_rideSeed = 0x9e3779b9u;   // our own random numbers: DOOM's affect demo sync
 static int g_exited;         // the exit has been triggered this level
 static mobj_t* g_target;
@@ -1427,14 +1431,19 @@ static int SuitWanted(mobj_t* mo)
     return 0;
 }
 
-// Back to the objective the suit interrupted (PlanTour keeps it if it can).
-static void EndSuit(void)
+static int IsPickup(int kind)
 {
-    g_objKind = g_suitResumeKind;
-    g_objLine = g_suitResumeLine;
-    g_objKey = g_suitResumeKey;
-    g_objColor = g_suitResumeColor;
-    g_objStucks = g_suitResumeStucks;
+    return kind == OBJ_SUIT || kind == OBJ_HEALTH;
+}
+
+// Back to the objective a radiation suit or health item interrupted (PlanTour keeps it if it can).
+static void EndPickup(void)
+{
+    g_objKind = g_pickupResumeKind;
+    g_objLine = g_pickupResumeLine;
+    g_objKey = g_pickupResumeKey;
+    g_objColor = g_pickupResumeColor;
+    g_objStucks = g_pickupResumeStucks;
     g_objArrivedTic = -1;
 }
 
@@ -1473,13 +1482,16 @@ static int PlanSuit(mobj_t* mo)
 
     if (goal >= 0)
     {
+        if (!IsPickup(g_objKind))
+        {
+            g_pickupResumeKind = g_objKind;
+            g_pickupResumeLine = g_objLine;
+            g_pickupResumeKey = g_objKey;
+            g_pickupResumeColor = g_objColor;
+            g_pickupResumeStucks = g_objStucks;
+        }
         if (g_objKind != OBJ_SUIT)
         {
-            g_suitResumeKind = g_objKind;
-            g_suitResumeLine = g_objLine;
-            g_suitResumeKey = g_objKey;
-            g_suitResumeColor = g_objColor;
-            g_suitResumeStucks = g_objStucks;
             g_objStucks = 0;
             LOGI("Ride: on damaging floor; heading for a radiation suit, %d units", cost[goal] * CELL / 10);
         }
@@ -1498,15 +1510,108 @@ static int PlanSuit(mobj_t* mo)
     return goal >= 0;
 }
 
+// Health: below HEALTH_LOW, ride to the nearest stimpack, medikit or soulsphere that can be
+// reached, then carry on with what we were doing. With none to be had, PlanTour heads for an exit
+// it can reach before any more keys or switches.
+static int IsHealthItem(mobj_t* m)
+{
+    return (m->type == MT_MISC10 || m->type == MT_MISC11 || m->type == MT_MISC12) && (m->flags & MF_SPECIAL);
+}
+
+static int HealthLow(mobj_t* mo)
+{
+    return mo->player && mo->player->health > 0 && mo->player->health < HEALTH_LOW;
+}
+
+// The health item being ridden to is still lying there (not picked up).
+static int HealthItemThere(mobj_t* item)
+{
+    for (thinker_t* th = thinkercap.next; th != &thinkercap; th = th->next)
+        if ((mobj_t*)th == item)
+            return th->function.acp1 == (actionf_p1)P_MobjThinker && IsHealthItem(item);
+    return 0;
+}
+
+// Route to the nearest reachable health item if health is low; false if there is none.
+static int PlanHealth(mobj_t* mo)
+{
+    if (!HealthLow(mo))
+        return 0;
+    int any = 0;   // no search when there is nothing left to look for
+    for (thinker_t* th = thinkercap.next; th != &thinkercap && !any; th = th->next)
+        any = th->function.acp1 == (actionf_p1)P_MobjThinker && IsHealthItem((mobj_t*)th) &&
+              !KeyAbandoned((mobj_t*)th);
+    if (!any)
+        return 0;
+    int start = NearestWalkable(mo->x / (float)FRACUNIT, mo->y / (float)FRACUNIT);
+    if (start < 0)
+        return 0;
+    int cells = g_gridW * g_gridH;
+    int* cost = malloc(cells * sizeof(int));
+    int* parent = malloc(cells * sizeof(int));
+    byte* closed = malloc(cells);
+    Search(start, 0, cost, parent, closed);
+
+    int goal = -1;
+    mobj_t* item = NULL;
+    for (thinker_t* th = thinkercap.next; th != &thinkercap; th = th->next)
+    {
+        if (th->function.acp1 != (actionf_p1)P_MobjThinker)
+            continue;
+        mobj_t* m = (mobj_t*)th;
+        if (!IsHealthItem(m) || KeyAbandoned(m))
+            continue;
+        float hx = m->x / (float)FRACUNIT, hy = m->y / (float)FRACUNIT;
+        int c = BestCellNear(hx, hy, hx, hy, 20, NULL, cost, closed);
+        if (c >= 0 && (goal < 0 || cost[c] < cost[goal]))
+        {
+            goal = c;
+            item = m;
+        }
+    }
+
+    if (goal >= 0)
+    {
+        if (!IsPickup(g_objKind))
+        {
+            g_pickupResumeKind = g_objKind;
+            g_pickupResumeLine = g_objLine;
+            g_pickupResumeKey = g_objKey;
+            g_pickupResumeColor = g_objColor;
+            g_pickupResumeStucks = g_objStucks;
+        }
+        if (g_objKind != OBJ_HEALTH || g_objKey != item)
+        {
+            g_objStucks = 0;
+            LOGI("Ride: health %d; heading for a %s, %d units", mo->player->health,
+                 item->type == MT_MISC10 ? "stimpack" : item->type == MT_MISC11 ? "medikit" : "soulsphere",
+                 cost[goal] * CELL / 10);
+        }
+        free(g_route);
+        g_route = NULL;
+        SetRoute(goal, parent);
+        g_objKind = OBJ_HEALTH;
+        g_objKey = item;
+        g_objArrivedTic = -1;
+        g_lastPlanTic = gametic;
+        g_holdingSince = -1;
+    }
+    free(cost);
+    free(parent);
+    free(closed);
+    return goal >= 0;
+}
+
 static void PlanTour(mobj_t* mo)
 {
     g_lastPlanTic = gametic;
     RebuildGridIfStale();
-    // 0. On damaging floor, a radiation suit first.
-    if (PlanSuit(mo))
+    // 0. On damaging floor, a radiation suit first; with health low, a health item.
+    if (PlanSuit(mo) || PlanHealth(mo))
         return;
-    if (g_objKind == OBJ_SUIT)
-        EndSuit();   // got it, or it can't be reached any more
+    if (IsPickup(g_objKind))
+        EndPickup();   // got it, or it can't be reached any more
+    int lowHealth = HealthLow(mo);   // and nothing to heal with: out by the nearest way
     free(g_route);
     g_route = NULL;
     g_routeLen = 0;
@@ -1538,8 +1643,28 @@ static void PlanTour(mobj_t* mo)
     int keepPending = 0;   // the kept objective is still there to get
     int keepCell = -1;     // and where to reach it, if it can be reached
 
+    int bossesLive = NearestBoss(mo, NULL) != NULL;
+
+    // Health low with no health item to be had: an exit that can be reached now comes before keys
+    // and switches.
+    if (lowHealth && !bossesLive)
+        for (int pass = 0; pass < 2 && goal < 0; pass++)
+        {
+            int flag = pass ? CF_GOAL2 : CF_GOAL;
+            for (int c = 0; c < cells; c++)
+                if (closed[c] && (g_cellFlags[c] & flag) && (goal < 0 || cost[c] < cost[goal]))
+                    goal = c;
+            if (goal >= 0)
+            {
+                g_objKind = OBJ_EXIT;
+                g_objExitFlag = flag;
+                keepKind = OBJ_NONE;   // no grit: the way out matters more now
+                LOGI("Ride: health %d and no health to be had; heading out", mo->player->health);
+            }
+        }
+
     // 1. The nearest key not yet held.
-    for (thinker_t* th = thinkercap.next; th != &thinkercap; th = th->next)
+    for (thinker_t* th = thinkercap.next; th != &thinkercap && g_objKind != OBJ_EXIT; th = th->next)
     {
         if (th->function.acp1 != (actionf_p1)P_MobjThinker)
             continue;
@@ -1630,7 +1755,6 @@ static void PlanTour(mobj_t* mo)
         LOGI("Ride: can't reach the objective any more; choosing another");
 
     // 3. The wanted exit, else the other one; never while a boss level's bosses live.
-    int bossesLive = NearestBoss(mo, NULL) != NULL;
     for (int pass = 0; pass < 2 && goal < 0 && !bossesLive; pass++)
     {
         int flag = pass ? CF_GOAL2 : CF_GOAL;
@@ -1694,12 +1818,12 @@ static void PlanTour(mobj_t* mo)
 static void AbandonObjective(const char* why)
 {
     LOGI("Ride: giving up on this objective (%s)", why);
-    if ((g_objKind == OBJ_KEY || g_objKind == OBJ_SUIT) && g_numAbandonedKeys < 16)
+    if ((g_objKind == OBJ_KEY || IsPickup(g_objKind)) && g_numAbandonedKeys < 32)
         g_abandonedKeys[g_numAbandonedKeys++] = g_objKey;
     else if (g_objKind == OBJ_LINE)
         g_lineState[g_objLine] = LINE_ABANDONED;
-    if (g_objKind == OBJ_SUIT)
-        EndSuit();   // back to what it interrupted
+    if (IsPickup(g_objKind))
+        EndPickup();   // back to what it interrupted
     else
     {
         g_objKind = OBJ_NONE;
@@ -1811,7 +1935,16 @@ static void CheckObjective(mobj_t* mo)
     if (g_objKind == OBJ_SUIT && mo->player->powers[pw_ironfeet] >= SUIT_LOW)
     {
         LOGI("Ride: got the radiation suit");
-        EndSuit();
+        EndPickup();
+        g_routeState = ROUTE_NONE;
+        return;
+    }
+    if (g_objKind == OBJ_HEALTH && (!HealthItemThere(g_objKey) || !HealthLow(mo)))
+    {
+        // Picked up (PlanTour looks for another if health is still low), or someone else got it,
+        // or health is back up some other way.
+        LOGI("Ride: health %d, done with that health item", mo->player->health);
+        EndPickup();
         g_routeState = ROUTE_NONE;
         return;
     }
@@ -2814,6 +2947,7 @@ int RIDE_Objective(void)
       case OBJ_BOSS: code = 7; break;
       case OBJ_DETOUR: code = 8; break;
       case OBJ_SUIT: code = 9; break;
+      case OBJ_HEALTH: code = 10; break;
     }
     if (g_fighting)
         code = 7;
@@ -2937,6 +3071,8 @@ void RIDE_BuildTiccmd(ticcmd_t* cmd)
         g_objKind = OBJ_NONE;
         g_objStucks = 0;
         g_suitCheckTic = 0;
+        g_healthCheckTic = 0;
+        g_lowHealthReplanned = 0;
         g_settleLine = -1;
         g_evadeTics = 0;
         g_evadeRestUntil = 0;
@@ -3000,13 +3136,30 @@ void RIDE_BuildTiccmd(ticcmd_t* cmd)
             g_suitCheckTic = gametic + SUIT_RECHECK;
             PlanSuit(mo);
         }
+        // Health low: look now and then for a health item. With none to be had, plan the tour
+        // again once, so it heads out if an exit can be reached.
+        if (!HealthLow(mo))
+            g_lowHealthReplanned = 0;
+        else if (g_routeState == ROUTE_OK && !IsPickup(g_objKind) && g_objKind != OBJ_DETOUR &&
+                 gametic >= g_healthCheckTic)
+        {
+            g_healthCheckTic = gametic + HEALTH_RECHECK;
+            if (!PlanHealth(mo) && !g_lowHealthReplanned && !boss &&
+                (g_objKind == OBJ_KEY || g_objKind == OBJ_LINE))
+            {
+                g_lowHealthReplanned = 1;
+                g_routeState = ROUTE_NONE;
+            }
+        }
         if (g_routeState == ROUTE_NONE)
         {
             if (boss)
             {
                 RebuildGridIfStale();
-                if (!PlanSuit(mo))
+                if (!PlanSuit(mo) && !PlanHealth(mo))
                 {
+                    if (IsPickup(g_objKind))
+                        EndPickup();
                     MarkBossSpots();   // head for where the bosses are now
                     PlanRoute(mo, CF_BOSS);
                     g_objKind = OBJ_BOSS;
@@ -3276,7 +3429,7 @@ void RIDE_BuildTiccmd(ticcmd_t* cmd)
                 g_objColor = g_savedColor;
             }
             int abandoned = 0;
-            if (++g_objStucks >= 3 && (g_objKind == OBJ_KEY || g_objKind == OBJ_LINE || g_objKind == OBJ_SUIT))
+            if (++g_objStucks >= 3 && (g_objKind == OBJ_KEY || g_objKind == OBJ_LINE || IsPickup(g_objKind)))
             {
                 AbandonObjective("stuck on the way");
                 abandoned = 1;

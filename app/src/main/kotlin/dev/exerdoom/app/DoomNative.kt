@@ -61,7 +61,7 @@ object DoomNative {
     /**
      * What ride mode's route heads for: 1-3 blue/yellow/red key, 4 a switch, 5 the exit, 6 the
      * secret exit, 7 the boss, 8 a detour after getting stuck,
-     * 9 a radiation suit (on damaging floor); plus 16 when doors and floors are being opened regardless.
+     * 9 a radiation suit (on damaging floor), 10 a health item (health low); plus 16 when doors and floors are being opened regardless.
      */
     @JvmStatic external fun nativeRideObjective(): Int
 
@@ -75,6 +75,7 @@ object DoomNative {
         7 -> "BOSS"
         8 -> "DETOUR"
         9 -> "RAD SUIT"
+        10 -> "HEALTH"
         else -> null
     }
 
