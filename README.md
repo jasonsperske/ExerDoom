@@ -120,6 +120,7 @@ How the route is planned (`app/src/main/cpp/ride.c`):
    - Then it goes back to the objective it was heading for. An objective that causes three stalls is dropped.
    - If the next step needs a platform or floor moved again, the rider rides to that floor's repeatable switch or line and uses it.
 6. **Lifts that trap are avoided.** Some lifts are raised to their ceiling by walk-over or switch lines on their own edge (specials 5, 55, 56, 65, 91, 94): stepping on or off can lift the floor with the player on it, or seal the player inside. E1M5's booths and E1M7's pillar are examples. Routes treat these lifts as fixed at their current height, and every cell in one costs heavily, so they are used only if there is no other way. Their lines are never objectives, and detours never end in one.
+7. **Radiation suits on damaging floor.** When the rider is standing on damaging floor (nukage, slime, lava; sector specials 4, 5, 7, 11 and 16) without a radiation suit, or with less than 4 seconds left of one, and a suit can be reached within 1536 units of route (damaging floor counts extra), the rider goes for the suit first (RAD SUIT on the readout). This is checked when planning and every 2 seconds while on damaging floor, also on boss levels. Once the suit is picked up, or dropped because it can't be got, the rider goes back to the objective it interrupted.
 
 Pace and resistance come from soloton's bike library ([below](#bike-library)) 20 times a second. To check the bike's sensors on a real bike:
 

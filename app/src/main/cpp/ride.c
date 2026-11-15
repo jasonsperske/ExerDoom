@@ -111,6 +111,9 @@ extern int viewwindowx, viewwindowy;
 #define SHOT_TICS       35      // step out of the way of a shot arriving within this many tics ...
 #define SHOT_MARGIN     20.0f   // ... that would pass within this much of the player's edge
 #define DODGE_MOVE      40      // dodge at least this fast (of MAX_MOVE), pedalling or not
+#define SUIT_LOW        (4*TICRATE)   // on damaging floor with less than this left of a radiation suit ...
+#define SUIT_MAX        1536.0f // ... ride to a suit this near (route cost, damaging floor counted heavier)
+#define SUIT_RECHECK    (2*TICRATE)   // look for one this often while on damaging floor
 
 // ---------------------------------------------------------------------------
 // Inputs from the UI thread
@@ -250,7 +253,7 @@ static int g_level;          // bumped by RIDE_LevelLoaded so the game thread re
 static int g_builtLevel = -1;
 
 // The tour (per level, kept across grid rebuilds)
-enum { OBJ_NONE, OBJ_KEY, OBJ_LINE, OBJ_EXIT, OBJ_BOSS, OBJ_DETOUR };
+enum { OBJ_NONE, OBJ_KEY, OBJ_LINE, OBJ_EXIT, OBJ_BOSS, OBJ_DETOUR, OBJ_SUIT };
 #define LINE_DONE      1
 #define LINE_ABANDONED 2
 static byte* g_lineState;    // per line: LINE_DONE once triggered, LINE_ABANDONED if unreachable
@@ -262,7 +265,7 @@ static int g_preferSecret;   // this map's secret exit leads to a level not othe
 static int g_gridKeys = -1, g_gridLines = -1, g_gridMagic = -1;   // state the grid was built for
 static int g_objKind;        // what the current route is heading for
 static int g_objLine = -1;   // OBJ_LINE: the line
-static mobj_t* g_objKey;     // OBJ_KEY: the key
+static mobj_t* g_objKey;     // OBJ_KEY: the key; OBJ_SUIT: the radiation suit
 static int g_objColor;       // OBJ_KEY: its colour
 static int g_objExitFlag;    // OBJ_EXIT: CF_GOAL or CF_GOAL2
 static int g_objStucks;      // times stuck while heading for this objective
@@ -270,6 +273,9 @@ static int g_objArrivedTic = -1;   // reached the end of the route without compl
 static int g_detourUntil;    // OBJ_DETOUR: when to stop and plan again
 static int g_savedKind, g_savedLine, g_savedColor;   // the objective a detour interrupted
 static mobj_t* g_savedKey;
+static int g_suitResumeKind, g_suitResumeLine, g_suitResumeColor, g_suitResumeStucks;   // the objective
+static mobj_t* g_suitResumeKey;                                   // a radiation suit interrupted
+static int g_suitCheckTic;   // next look for a radiation suit while on damaging floor
 static unsigned g_rideSeed = 0x9e3779b9u;   // our own random numbers: DOOM's affect demo sync
 static int g_exited;         // the exit has been triggered this level
 static mobj_t* g_target;
@@ -1396,10 +1402,111 @@ static int AnythingMoving(void);
 static int g_planHoldUntil;
 static int g_holdingSince = -1;    // first tic we held off falling back because things moved
 
+// Radiation suits: on damaging floor (nukage, slime, lava) with no suit on, or one about to run
+// out, ride to the nearest one that can be reached and isn't far, then carry on with what we were
+// doing.
+static int IsSuit(mobj_t* m)
+{
+    return m->type == MT_MISC14 && (m->flags & MF_SPECIAL);
+}
+
+static int OnDamagingFloor(mobj_t* mo)
+{
+    return g_secFlags && (g_secFlags[SectorIndex(mo->subsector->sector)] & SF_HAZARD);
+}
+
+static int SuitWanted(mobj_t* mo)
+{
+    if (!mo->player || mo->player->powers[pw_ironfeet] >= SUIT_LOW)
+        return 0;
+    if (g_objKind != OBJ_SUIT && !OnDamagingFloor(mo))
+        return 0;
+    for (thinker_t* th = thinkercap.next; th != &thinkercap; th = th->next)
+        if (th->function.acp1 == (actionf_p1)P_MobjThinker && IsSuit((mobj_t*)th) && !KeyAbandoned((mobj_t*)th))
+            return 1;
+    return 0;
+}
+
+// Back to the objective the suit interrupted (PlanTour keeps it if it can).
+static void EndSuit(void)
+{
+    g_objKind = g_suitResumeKind;
+    g_objLine = g_suitResumeLine;
+    g_objKey = g_suitResumeKey;
+    g_objColor = g_suitResumeColor;
+    g_objStucks = g_suitResumeStucks;
+    g_objArrivedTic = -1;
+}
+
+// Route to the nearest radiation suit if one is wanted and near enough; false if not.
+static int PlanSuit(mobj_t* mo)
+{
+    if (!SuitWanted(mo))
+        return 0;
+    int start = NearestWalkable(mo->x / (float)FRACUNIT, mo->y / (float)FRACUNIT);
+    if (start < 0)
+        return 0;
+    int cells = g_gridW * g_gridH;
+    int* cost = malloc(cells * sizeof(int));
+    int* parent = malloc(cells * sizeof(int));
+    byte* closed = malloc(cells);
+    Search(start, 0, cost, parent, closed);
+
+    int goal = -1;
+    mobj_t* suit = NULL;
+    int limit = (int)(SUIT_MAX / CELL * 10);
+    for (thinker_t* th = thinkercap.next; th != &thinkercap; th = th->next)
+    {
+        if (th->function.acp1 != (actionf_p1)P_MobjThinker)
+            continue;
+        mobj_t* m = (mobj_t*)th;
+        if (!IsSuit(m) || KeyAbandoned(m))
+            continue;
+        float sx = m->x / (float)FRACUNIT, sy = m->y / (float)FRACUNIT;
+        int c = BestCellNear(sx, sy, sx, sy, 20, NULL, cost, closed);
+        if (c >= 0 && cost[c] <= limit && (goal < 0 || cost[c] < cost[goal]))
+        {
+            goal = c;
+            suit = m;
+        }
+    }
+
+    if (goal >= 0)
+    {
+        if (g_objKind != OBJ_SUIT)
+        {
+            g_suitResumeKind = g_objKind;
+            g_suitResumeLine = g_objLine;
+            g_suitResumeKey = g_objKey;
+            g_suitResumeColor = g_objColor;
+            g_suitResumeStucks = g_objStucks;
+            g_objStucks = 0;
+            LOGI("Ride: on damaging floor; heading for a radiation suit, %d units", cost[goal] * CELL / 10);
+        }
+        free(g_route);
+        g_route = NULL;
+        SetRoute(goal, parent);
+        g_objKind = OBJ_SUIT;
+        g_objKey = suit;
+        g_objArrivedTic = -1;
+        g_lastPlanTic = gametic;
+        g_holdingSince = -1;
+    }
+    free(cost);
+    free(parent);
+    free(closed);
+    return goal >= 0;
+}
+
 static void PlanTour(mobj_t* mo)
 {
     g_lastPlanTic = gametic;
     RebuildGridIfStale();
+    // 0. On damaging floor, a radiation suit first.
+    if (PlanSuit(mo))
+        return;
+    if (g_objKind == OBJ_SUIT)
+        EndSuit();   // got it, or it can't be reached any more
     free(g_route);
     g_route = NULL;
     g_routeLen = 0;
@@ -1587,12 +1694,17 @@ static void PlanTour(mobj_t* mo)
 static void AbandonObjective(const char* why)
 {
     LOGI("Ride: giving up on this objective (%s)", why);
-    if (g_objKind == OBJ_KEY && g_numAbandonedKeys < 16)
+    if ((g_objKind == OBJ_KEY || g_objKind == OBJ_SUIT) && g_numAbandonedKeys < 16)
         g_abandonedKeys[g_numAbandonedKeys++] = g_objKey;
     else if (g_objKind == OBJ_LINE)
         g_lineState[g_objLine] = LINE_ABANDONED;
-    g_objKind = OBJ_NONE;
-    g_objStucks = 0;
+    if (g_objKind == OBJ_SUIT)
+        EndSuit();   // back to what it interrupted
+    else
+    {
+        g_objKind = OBJ_NONE;
+        g_objStucks = 0;
+    }
     g_routeState = ROUTE_NONE;
 }
 
@@ -1694,6 +1806,13 @@ static void CheckObjective(mobj_t* mo)
             g_objColor = g_savedColor;
             g_routeState = ROUTE_NONE;
         }
+        return;
+    }
+    if (g_objKind == OBJ_SUIT && mo->player->powers[pw_ironfeet] >= SUIT_LOW)
+    {
+        LOGI("Ride: got the radiation suit");
+        EndSuit();
+        g_routeState = ROUTE_NONE;
         return;
     }
     if (g_objKind == OBJ_KEY && HasKey(g_objColor))
@@ -2694,6 +2813,7 @@ int RIDE_Objective(void)
       case OBJ_EXIT: code = (g_objExitFlag == CF_GOAL) == g_preferSecret ? 6 : 5; break;   // 6: secret
       case OBJ_BOSS: code = 7; break;
       case OBJ_DETOUR: code = 8; break;
+      case OBJ_SUIT: code = 9; break;
     }
     if (g_fighting)
         code = 7;
@@ -2816,6 +2936,7 @@ void RIDE_BuildTiccmd(ticcmd_t* cmd)
         g_preferSecret = PreferSecretExit();
         g_objKind = OBJ_NONE;
         g_objStucks = 0;
+        g_suitCheckTic = 0;
         g_settleLine = -1;
         g_evadeTics = 0;
         g_evadeRestUntil = 0;
@@ -2870,18 +2991,30 @@ void RIDE_BuildTiccmd(ticcmd_t* cmd)
         g_routeState = ROUTE_NONE;   // plan afresh after the fight
     else if (!holding)
     {
+        // Rode onto damaging floor (or the suit is running out on it): look now and then for a
+        // radiation suit near enough to be worth the trip, without waiting for the next plan. Not
+        // on a detour: that is getting unstuck, and plans again when it ends.
+        if (g_routeState == ROUTE_OK && g_objKind != OBJ_SUIT && g_objKind != OBJ_DETOUR &&
+            gametic >= g_suitCheckTic && SuitWanted(mo))
+        {
+            g_suitCheckTic = gametic + SUIT_RECHECK;
+            PlanSuit(mo);
+        }
         if (g_routeState == ROUTE_NONE)
         {
             if (boss)
             {
                 RebuildGridIfStale();
-                MarkBossSpots();   // head for where the bosses are now
-                PlanRoute(mo, CF_BOSS);
-                g_objKind = OBJ_BOSS;
-                // No way to the bosses yet (E1M8 starts behind a switch): tour for keys and
-                // switches, and try the bosses again after each one.
-                if (g_routeState != ROUTE_OK)
-                    PlanTour(mo);
+                if (!PlanSuit(mo))
+                {
+                    MarkBossSpots();   // head for where the bosses are now
+                    PlanRoute(mo, CF_BOSS);
+                    g_objKind = OBJ_BOSS;
+                    // No way to the bosses yet (E1M8 starts behind a switch): tour for keys and
+                    // switches, and try the bosses again after each one.
+                    if (g_routeState != ROUTE_OK)
+                        PlanTour(mo);
+                }
             }
             else
                 PlanTour(mo);
@@ -3143,7 +3276,7 @@ void RIDE_BuildTiccmd(ticcmd_t* cmd)
                 g_objColor = g_savedColor;
             }
             int abandoned = 0;
-            if (++g_objStucks >= 3 && (g_objKind == OBJ_KEY || g_objKind == OBJ_LINE))
+            if (++g_objStucks >= 3 && (g_objKind == OBJ_KEY || g_objKind == OBJ_LINE || g_objKind == OBJ_SUIT))
             {
                 AbandonObjective("stuck on the way");
                 abandoned = 1;
