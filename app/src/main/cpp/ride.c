@@ -96,6 +96,8 @@ extern int viewwindowx, viewwindowy;
 #define BOSS_UNSEEN_TICS (3*TICRATE) // keep fighting this long after losing sight of it
 #define BOSS_KEEP_MIN   320.0f  // circle a boss between these distances
 #define BOSS_KEEP_MAX   640.0f
+#define BOSS_OPEN       1.5f    // while fighting, how much room ahead counts against the wanted heading
+#define BOSS_CLAW       160.0f  // a boss this close can soon claw: get away from it before anything else
 #define DODGE_TICS      40      // react to a shot arriving within this many tics
 #define DODGE_RADIUS    80.0f   // ... that would pass this close
 #define MPS_PER_RPM     0.042f  // the bike library's cadence-to-pace mapping (CadencePace)
@@ -111,6 +113,11 @@ extern int viewwindowx, viewwindowy;
 #define SHOT_TICS       35      // step out of the way of a shot arriving within this many tics ...
 #define SHOT_MARGIN     20.0f   // ... that would pass within this much of the player's edge
 #define DODGE_MOVE      40      // dodge at least this fast (of MAX_MOVE), pedalling or not
+#define SUIT_LOW        (4*TICRATE)   // on damaging floor with less than this left of a radiation suit ...
+#define SUIT_MAX        1536.0f // ... ride to a suit this near (route cost, damaging floor counted heavier)
+#define SUIT_RECHECK    (2*TICRATE)   // look for one this often while on damaging floor
+#define HEALTH_LOW      80      // below this much health, ride to a stimpack, medikit or soulsphere
+#define HEALTH_RECHECK  (2*TICRATE)   // look for one this often while health is low
 
 // ---------------------------------------------------------------------------
 // Inputs from the UI thread
@@ -129,6 +136,10 @@ static int g_weapon = -1;          // weapon ride mode has chosen, or -1; read b
 static int g_tiers[8], g_numTiers;   // weapons from weakest to strongest in this game
 static int g_tier = -1;
 static int g_lastSwitchTic = -1000;
+
+// Pedalling hard enough for the rocket launcher (or a stronger weapon) also gives god mode, and
+// splash damage no longer matters: rockets fly at anything and barrels are fair game.
+static int g_bikeGod;              // god mode given by the bike (not by IDDQD); game thread
 
 // Episode totals (game thread)
 static ridestats_t g_stats;
@@ -250,19 +261,19 @@ static int g_level;          // bumped by RIDE_LevelLoaded so the game thread re
 static int g_builtLevel = -1;
 
 // The tour (per level, kept across grid rebuilds)
-enum { OBJ_NONE, OBJ_KEY, OBJ_LINE, OBJ_EXIT, OBJ_BOSS, OBJ_DETOUR };
+enum { OBJ_NONE, OBJ_KEY, OBJ_LINE, OBJ_EXIT, OBJ_BOSS, OBJ_DETOUR, OBJ_SUIT, OBJ_HEALTH };
 #define LINE_DONE      1
 #define LINE_ABANDONED 2
 static byte* g_lineState;    // per line: LINE_DONE once triggered, LINE_ABANDONED if unreachable
 static int g_linesDone;      // count of LINE_DONE, to know when the grid is out of date
-static mobj_t* g_abandonedKeys[16];
+static mobj_t* g_abandonedKeys[32];
 static int g_numAbandonedKeys;
 static int g_magic;          // fallback: open and move everything on the route regardless
 static int g_preferSecret;   // this map's secret exit leads to a level not otherwise played
 static int g_gridKeys = -1, g_gridLines = -1, g_gridMagic = -1;   // state the grid was built for
 static int g_objKind;        // what the current route is heading for
 static int g_objLine = -1;   // OBJ_LINE: the line
-static mobj_t* g_objKey;     // OBJ_KEY: the key
+static mobj_t* g_objKey;     // OBJ_KEY: the key; OBJ_SUIT, OBJ_HEALTH: the item
 static int g_objColor;       // OBJ_KEY: its colour
 static int g_objExitFlag;    // OBJ_EXIT: CF_GOAL or CF_GOAL2
 static int g_objStucks;      // times stuck while heading for this objective
@@ -270,6 +281,11 @@ static int g_objArrivedTic = -1;   // reached the end of the route without compl
 static int g_detourUntil;    // OBJ_DETOUR: when to stop and plan again
 static int g_savedKind, g_savedLine, g_savedColor;   // the objective a detour interrupted
 static mobj_t* g_savedKey;
+static int g_pickupResumeKind, g_pickupResumeLine, g_pickupResumeColor, g_pickupResumeStucks;   // the objective
+static mobj_t* g_pickupResumeKey;                                 // a suit or health item interrupted
+static int g_suitCheckTic;   // next look for a radiation suit while on damaging floor
+static int g_healthCheckTic; // next look for health while health is low
+static int g_lowHealthReplanned;   // health went low and the tour was planned again for it
 static unsigned g_rideSeed = 0x9e3779b9u;   // our own random numbers: DOOM's affect demo sync
 static int g_exited;         // the exit has been triggered this level
 static mobj_t* g_target;
@@ -1396,10 +1412,212 @@ static int AnythingMoving(void);
 static int g_planHoldUntil;
 static int g_holdingSince = -1;    // first tic we held off falling back because things moved
 
+// Radiation suits: on damaging floor (nukage, slime, lava) with no suit on, or one about to run
+// out, ride to the nearest one that can be reached and isn't far, then carry on with what we were
+// doing.
+static int IsSuit(mobj_t* m)
+{
+    return m->type == MT_MISC14 && (m->flags & MF_SPECIAL);
+}
+
+static int OnDamagingFloor(mobj_t* mo)
+{
+    return g_secFlags && (g_secFlags[SectorIndex(mo->subsector->sector)] & SF_HAZARD);
+}
+
+static int SuitWanted(mobj_t* mo)
+{
+    if (!mo->player || mo->player->powers[pw_ironfeet] >= SUIT_LOW)
+        return 0;
+    if (g_objKind != OBJ_SUIT && !OnDamagingFloor(mo))
+        return 0;
+    for (thinker_t* th = thinkercap.next; th != &thinkercap; th = th->next)
+        if (th->function.acp1 == (actionf_p1)P_MobjThinker && IsSuit((mobj_t*)th) && !KeyAbandoned((mobj_t*)th))
+            return 1;
+    return 0;
+}
+
+static int IsPickup(int kind)
+{
+    return kind == OBJ_SUIT || kind == OBJ_HEALTH;
+}
+
+// Back to the objective a radiation suit or health item interrupted (PlanTour keeps it if it can).
+static void EndPickup(void)
+{
+    g_objKind = g_pickupResumeKind;
+    g_objLine = g_pickupResumeLine;
+    g_objKey = g_pickupResumeKey;
+    g_objColor = g_pickupResumeColor;
+    g_objStucks = g_pickupResumeStucks;
+    g_objArrivedTic = -1;
+}
+
+// Route to the nearest radiation suit if one is wanted and near enough; false if not.
+static int PlanSuit(mobj_t* mo)
+{
+    if (!SuitWanted(mo))
+        return 0;
+    int start = NearestWalkable(mo->x / (float)FRACUNIT, mo->y / (float)FRACUNIT);
+    if (start < 0)
+        return 0;
+    int cells = g_gridW * g_gridH;
+    int* cost = malloc(cells * sizeof(int));
+    int* parent = malloc(cells * sizeof(int));
+    byte* closed = malloc(cells);
+    Search(start, 0, cost, parent, closed);
+
+    int goal = -1;
+    mobj_t* suit = NULL;
+    int limit = (int)(SUIT_MAX / CELL * 10);
+    for (thinker_t* th = thinkercap.next; th != &thinkercap; th = th->next)
+    {
+        if (th->function.acp1 != (actionf_p1)P_MobjThinker)
+            continue;
+        mobj_t* m = (mobj_t*)th;
+        if (!IsSuit(m) || KeyAbandoned(m))
+            continue;
+        float sx = m->x / (float)FRACUNIT, sy = m->y / (float)FRACUNIT;
+        int c = BestCellNear(sx, sy, sx, sy, 20, NULL, cost, closed);
+        if (c >= 0 && cost[c] <= limit && (goal < 0 || cost[c] < cost[goal]))
+        {
+            goal = c;
+            suit = m;
+        }
+    }
+
+    if (goal >= 0)
+    {
+        if (!IsPickup(g_objKind))
+        {
+            g_pickupResumeKind = g_objKind;
+            g_pickupResumeLine = g_objLine;
+            g_pickupResumeKey = g_objKey;
+            g_pickupResumeColor = g_objColor;
+            g_pickupResumeStucks = g_objStucks;
+        }
+        if (g_objKind != OBJ_SUIT)
+        {
+            g_objStucks = 0;
+            LOGI("Ride: on damaging floor; heading for a radiation suit, %d units", cost[goal] * CELL / 10);
+        }
+        free(g_route);
+        g_route = NULL;
+        SetRoute(goal, parent);
+        g_objKind = OBJ_SUIT;
+        g_objKey = suit;
+        g_objArrivedTic = -1;
+        g_lastPlanTic = gametic;
+        g_holdingSince = -1;
+    }
+    free(cost);
+    free(parent);
+    free(closed);
+    return goal >= 0;
+}
+
+// Health: below HEALTH_LOW, ride to the nearest stimpack, medikit or soulsphere that can be
+// reached, then carry on with what we were doing. With none to be had, PlanTour heads for an exit
+// it can reach before any more keys or switches.
+static int IsHealthItem(mobj_t* m)
+{
+    return (m->type == MT_MISC10 || m->type == MT_MISC11 || m->type == MT_MISC12) && (m->flags & MF_SPECIAL);
+}
+
+static int HealthLow(mobj_t* mo)
+{
+    return mo->player && mo->player->health > 0 && mo->player->health < HEALTH_LOW;
+}
+
+// The health item being ridden to is still lying there (not picked up).
+static int HealthItemThere(mobj_t* item)
+{
+    for (thinker_t* th = thinkercap.next; th != &thinkercap; th = th->next)
+        if ((mobj_t*)th == item)
+            return th->function.acp1 == (actionf_p1)P_MobjThinker && IsHealthItem(item);
+    return 0;
+}
+
+// Route to the nearest reachable health item if health is low; false if there is none.
+static int PlanHealth(mobj_t* mo)
+{
+    if (!HealthLow(mo))
+        return 0;
+    int any = 0;   // no search when there is nothing left to look for
+    for (thinker_t* th = thinkercap.next; th != &thinkercap && !any; th = th->next)
+        any = th->function.acp1 == (actionf_p1)P_MobjThinker && IsHealthItem((mobj_t*)th) &&
+              !KeyAbandoned((mobj_t*)th);
+    if (!any)
+        return 0;
+    int start = NearestWalkable(mo->x / (float)FRACUNIT, mo->y / (float)FRACUNIT);
+    if (start < 0)
+        return 0;
+    int cells = g_gridW * g_gridH;
+    int* cost = malloc(cells * sizeof(int));
+    int* parent = malloc(cells * sizeof(int));
+    byte* closed = malloc(cells);
+    Search(start, 0, cost, parent, closed);
+
+    int goal = -1;
+    mobj_t* item = NULL;
+    for (thinker_t* th = thinkercap.next; th != &thinkercap; th = th->next)
+    {
+        if (th->function.acp1 != (actionf_p1)P_MobjThinker)
+            continue;
+        mobj_t* m = (mobj_t*)th;
+        if (!IsHealthItem(m) || KeyAbandoned(m))
+            continue;
+        float hx = m->x / (float)FRACUNIT, hy = m->y / (float)FRACUNIT;
+        int c = BestCellNear(hx, hy, hx, hy, 20, NULL, cost, closed);
+        if (c >= 0 && (goal < 0 || cost[c] < cost[goal]))
+        {
+            goal = c;
+            item = m;
+        }
+    }
+
+    if (goal >= 0)
+    {
+        if (!IsPickup(g_objKind))
+        {
+            g_pickupResumeKind = g_objKind;
+            g_pickupResumeLine = g_objLine;
+            g_pickupResumeKey = g_objKey;
+            g_pickupResumeColor = g_objColor;
+            g_pickupResumeStucks = g_objStucks;
+        }
+        if (g_objKind != OBJ_HEALTH || g_objKey != item)
+        {
+            g_objStucks = 0;
+            LOGI("Ride: health %d; heading for a %s, %d units", mo->player->health,
+                 item->type == MT_MISC10 ? "stimpack" : item->type == MT_MISC11 ? "medikit" : "soulsphere",
+                 cost[goal] * CELL / 10);
+        }
+        free(g_route);
+        g_route = NULL;
+        SetRoute(goal, parent);
+        g_objKind = OBJ_HEALTH;
+        g_objKey = item;
+        g_objArrivedTic = -1;
+        g_lastPlanTic = gametic;
+        g_holdingSince = -1;
+    }
+    free(cost);
+    free(parent);
+    free(closed);
+    return goal >= 0;
+}
+
 static void PlanTour(mobj_t* mo)
 {
     g_lastPlanTic = gametic;
     RebuildGridIfStale();
+    // 0. On damaging floor, a radiation suit first; with health low, a health item.
+    if (PlanSuit(mo) || PlanHealth(mo))
+        return;
+    if (IsPickup(g_objKind))
+        EndPickup();   // got it, or it can't be reached any more
+    int lowHealth = HealthLow(mo);   // and nothing to heal with: out by the nearest way
     free(g_route);
     g_route = NULL;
     g_routeLen = 0;
@@ -1431,8 +1649,28 @@ static void PlanTour(mobj_t* mo)
     int keepPending = 0;   // the kept objective is still there to get
     int keepCell = -1;     // and where to reach it, if it can be reached
 
+    int bossesLive = NearestBoss(mo, NULL) != NULL;
+
+    // Health low with no health item to be had: an exit that can be reached now comes before keys
+    // and switches.
+    if (lowHealth && !bossesLive)
+        for (int pass = 0; pass < 2 && goal < 0; pass++)
+        {
+            int flag = pass ? CF_GOAL2 : CF_GOAL;
+            for (int c = 0; c < cells; c++)
+                if (closed[c] && (g_cellFlags[c] & flag) && (goal < 0 || cost[c] < cost[goal]))
+                    goal = c;
+            if (goal >= 0)
+            {
+                g_objKind = OBJ_EXIT;
+                g_objExitFlag = flag;
+                keepKind = OBJ_NONE;   // no grit: the way out matters more now
+                LOGI("Ride: health %d and no health to be had; heading out", mo->player->health);
+            }
+        }
+
     // 1. The nearest key not yet held.
-    for (thinker_t* th = thinkercap.next; th != &thinkercap; th = th->next)
+    for (thinker_t* th = thinkercap.next; th != &thinkercap && g_objKind != OBJ_EXIT; th = th->next)
     {
         if (th->function.acp1 != (actionf_p1)P_MobjThinker)
             continue;
@@ -1523,7 +1761,6 @@ static void PlanTour(mobj_t* mo)
         LOGI("Ride: can't reach the objective any more; choosing another");
 
     // 3. The wanted exit, else the other one; never while a boss level's bosses live.
-    int bossesLive = NearestBoss(mo, NULL) != NULL;
     for (int pass = 0; pass < 2 && goal < 0 && !bossesLive; pass++)
     {
         int flag = pass ? CF_GOAL2 : CF_GOAL;
@@ -1587,12 +1824,17 @@ static void PlanTour(mobj_t* mo)
 static void AbandonObjective(const char* why)
 {
     LOGI("Ride: giving up on this objective (%s)", why);
-    if (g_objKind == OBJ_KEY && g_numAbandonedKeys < 16)
+    if ((g_objKind == OBJ_KEY || IsPickup(g_objKind)) && g_numAbandonedKeys < 32)
         g_abandonedKeys[g_numAbandonedKeys++] = g_objKey;
     else if (g_objKind == OBJ_LINE)
         g_lineState[g_objLine] = LINE_ABANDONED;
-    g_objKind = OBJ_NONE;
-    g_objStucks = 0;
+    if (IsPickup(g_objKind))
+        EndPickup();   // back to what it interrupted
+    else
+    {
+        g_objKind = OBJ_NONE;
+        g_objStucks = 0;
+    }
     g_routeState = ROUTE_NONE;
 }
 
@@ -1694,6 +1936,22 @@ static void CheckObjective(mobj_t* mo)
             g_objColor = g_savedColor;
             g_routeState = ROUTE_NONE;
         }
+        return;
+    }
+    if (g_objKind == OBJ_SUIT && mo->player->powers[pw_ironfeet] >= SUIT_LOW)
+    {
+        LOGI("Ride: got the radiation suit");
+        EndPickup();
+        g_routeState = ROUTE_NONE;
+        return;
+    }
+    if (g_objKind == OBJ_HEALTH && (!HealthItemThere(g_objKey) || !HealthLow(mo)))
+    {
+        // Picked up (PlanTour looks for another if health is still low), or someone else got it,
+        // or health is back up some other way.
+        LOGI("Ride: health %d, done with that health item", mo->player->health);
+        EndPickup();
+        g_routeState = ROUTE_NONE;
         return;
     }
     if (g_objKind == OBJ_KEY && HasKey(g_objColor))
@@ -2208,6 +2466,8 @@ static float BlastDistance(mobj_t* spot, mobj_t* victim)
 // *hurts.
 static int BarrelDanger(mobj_t* mo, float dirX, float dirY, int weapon, mobj_t** lit, mobj_t** hurts)
 {
+    if (g_bikeGod)
+        return 0;   // a blast can't hurt us
     if (!g_numBarrels)
         return 0;
     float half, width, range;
@@ -2356,13 +2616,25 @@ static int TurnTowards(angle_t current, angle_t wanted, int maxTurn)
 
 // Of 16 headings clear of walls for 48 units, the one nearest the wanted direction (wx, wy).
 // *score: the cosine between them, or -2 if every way is blocked.
+static angle_t ClearHeadingOpen(mobj_t* mo, float wx, float wy, float open, float* score);
+
 static angle_t ClearHeading(mobj_t* mo, float wx, float wy, float* score)
+{
+    return ClearHeadingOpen(mo, wx, wy, 0, score);
+}
+
+#define OPEN_RUN        256.0f  // how far ahead ClearHeadingOpen looks for room to keep moving
+
+// ClearHeading, also favouring headings with room to keep going (weighted by `open`), so a rider
+// circling a boss doesn't steer into a dead-end corner and get pinned there. *score is how well
+// the heading matches (wx, wy) alone.
+static angle_t ClearHeadingOpen(mobj_t* mo, float wx, float wy, float open, float* score)
 {
     float px = mo->x / (float)FRACUNIT, py = mo->y / (float)FRACUNIT;
     float len = sqrtf(wx * wx + wy * wy);
     int here = CellAt(px, py);
     int onHazard = here >= 0 && (g_cellFlags[here] & CF_HAZARD);
-    float bestScore = -2;
+    float bestScore = -2, bestValue = -1e9f;
     float bestX = wx, bestY = wy;
     for (int k = 0; k < 16; k++)
     {
@@ -2379,7 +2651,15 @@ static angle_t ClearHeading(mobj_t* mo, float wx, float wy, float* score)
         if (hazard)
             continue;
         float s = len > 0 ? (hx * wx + hy * wy) / len : 0;
-        if (s > bestScore) { bestScore = s; bestX = hx; bestY = hy; }
+        float value = s;
+        if (open > 0)
+        {
+            float run = 48;
+            while (run < OPEN_RUN && ClearPath(px + hx * run, py + hy * run, px + hx * (run + 32), py + hy * (run + 32)))
+                run += 32;
+            value += open * run / OPEN_RUN;
+        }
+        if (value > bestValue) { bestValue = value; bestScore = s; bestX = hx; bestY = hy; }
     }
     *score = bestScore;
     return R_PointToAngle2(mo->x, mo->y, mo->x + (fixed_t)(bestX * 64 * FRACUNIT), mo->y + (fixed_t)(bestY * 64 * FRACUNIT));
@@ -2492,6 +2772,33 @@ static int ShotDodge(mobj_t* mo, float moveX, float moveY, float* outX, float* o
     return n;
 }
 
+// Away from every boss nearer than `range` (not just the one being fought: on E1M8 the other
+// baron walks up while the rider circles the first), most urgently from one close enough to claw.
+// Adds a push to (*wx, *wy); returns how many bosses are that near.
+static int BossRepel(mobj_t* mo, float range, float* wx, float* wy)
+{
+    int n = 0;
+    float px = mo->x / (float)FRACUNIT, py = mo->y / (float)FRACUNIT;
+    for (thinker_t* th = thinkercap.next; th != &thinkercap; th = th->next)
+    {
+        if (th->function.acp1 != (actionf_p1)P_MobjThinker || !IsBoss((mobj_t*)th))
+            continue;
+        mobj_t* m = (mobj_t*)th;
+        float ax = px - m->x / (float)FRACUNIT, ay = py - m->y / (float)FRACUNIT;
+        float d = sqrtf(ax * ax + ay * ay);
+        if (d >= range)
+            continue;
+        if (d < 1) d = 1;
+        float push = 1.5f * (range - d) / range + 0.5f;
+        if (d < BOSS_CLAW)
+            push += 3.0f * (BOSS_CLAW - d) / BOSS_CLAW + 1.0f;
+        *wx += ax / d * push;
+        *wy += ay / d * push;
+        n++;
+    }
+    return n;
+}
+
 // The way to move while fighting a boss: circle it between BOSS_KEEP_MIN and BOSS_KEEP_MAX,
 // sidestep shots heading our way, and only ever take a heading that is clear of walls.
 static angle_t BossSteer(mobj_t* mo, mobj_t* boss)
@@ -2503,15 +2810,16 @@ static angle_t BossSteer(mobj_t* mo, mobj_t* boss)
     ax /= d;
     ay /= d;                                  // unit vector away from the boss
 
-    // Round the boss, pulled back into the band if too close or too far.
+    // Round the boss, pulled back into the band if too far; pushed away from it, and from any
+    // other boss, if too close.
     float wx = -ay * g_orbit, wy = ax * g_orbit;
-    float radial = 0;
-    if (d < BOSS_KEEP_MIN)
-        radial = 1.5f * (BOSS_KEEP_MIN - d) / BOSS_KEEP_MIN + 0.5f;
-    else if (d > BOSS_KEEP_MAX)
-        radial = -fminf(1.5f, (d - BOSS_KEEP_MAX) / 200.0f + 0.3f);
-    wx += ax * radial;
-    wy += ay * radial;
+    if (d > BOSS_KEEP_MAX)
+    {
+        float radial = -fminf(1.5f, (d - BOSS_KEEP_MAX) / 200.0f + 0.3f);
+        wx += ax * radial;
+        wy += ay * radial;
+    }
+    BossRepel(mo, BOSS_KEEP_MIN, &wx, &wy);
 
     // Dodge: for each shot, where will it pass closest to us, and when?
     for (thinker_t* th = thinkercap.next; th != &thinkercap; th = th->next)
@@ -2546,7 +2854,7 @@ static angle_t BossSteer(mobj_t* mo, mobj_t* boss)
     }
 
     float bestScore;
-    angle_t heading = ClearHeading(mo, wx, wy, &bestScore);
+    angle_t heading = ClearHeadingOpen(mo, wx, wy, BOSS_OPEN, &bestScore);
 
     // Boxed in on this side: go round the other way.
     if (bestScore < 0.2f)
@@ -2615,6 +2923,8 @@ static void BuildTiers(void)
 // that could step into the shot. margin widens both distances.
 static int RocketSafe(mobj_t* mo, float margin)
 {
+    if (g_bikeGod)
+        return 1;   // the splash can't hurt us
     if (g_target)
     {
         float dx = (g_target->x - mo->x) / (float)FRACUNIT, dy = (g_target->y - mo->y) / (float)FRACUNIT;
@@ -2635,6 +2945,24 @@ static int RocketSafe(mobj_t* mo, float margin)
     return 1;
 }
 
+static void SetBikeGod(player_t* player, int on)
+{
+    if (on && !g_bikeGod && !(player->cheats & CF_GODMODE))
+    {
+        player->cheats |= CF_GODMODE;
+        g_bikeGod = 1;
+        LOGI("Ride: rocket power; god mode on");
+    }
+    else if (on && g_bikeGod)
+        player->cheats |= CF_GODMODE;   // E1M8's last room takes it away each tic: give it back
+    else if (!on && g_bikeGod)
+    {
+        player->cheats &= ~CF_GODMODE;
+        g_bikeGod = 0;
+        LOGI("Ride: below rocket power; god mode off");
+    }
+}
+
 static void ChooseWeapon(player_t* player)
 {
     if (!g_numTiers)
@@ -2649,6 +2977,11 @@ static void ChooseWeapon(player_t* player)
     g_tier = tier;
 
     int weapon = g_tiers[tier];
+    // Rocket power or more: god mode too, on while the tier holds (IDDQD typed by hand is left alone).
+    int godTier = 0;
+    while (godTier < g_numTiers - 1 && g_tiers[godTier] != wp_missile)
+        godTier++;
+    SetBikeGod(player, tier >= godTier);
     // Coming back to rockets needs a little more room than leaving them, so it doesn't flap.
     if (weapon == wp_missile &&
         !RocketSafe(player->mo, player->readyweapon == wp_missile ? 0 : ROCKET_RETURN))
@@ -2694,6 +3027,8 @@ int RIDE_Objective(void)
       case OBJ_EXIT: code = (g_objExitFlag == CF_GOAL) == g_preferSecret ? 6 : 5; break;   // 6: secret
       case OBJ_BOSS: code = 7; break;
       case OBJ_DETOUR: code = 8; break;
+      case OBJ_SUIT: code = 9; break;
+      case OBJ_HEALTH: code = 10; break;
     }
     if (g_fighting)
         code = 7;
@@ -2816,6 +3151,9 @@ void RIDE_BuildTiccmd(ticcmd_t* cmd)
         g_preferSecret = PreferSecretExit();
         g_objKind = OBJ_NONE;
         g_objStucks = 0;
+        g_suitCheckTic = 0;
+        g_healthCheckTic = 0;
+        g_lowHealthReplanned = 0;
         g_settleLine = -1;
         g_evadeTics = 0;
         g_evadeRestUntil = 0;
@@ -2828,7 +3166,10 @@ void RIDE_BuildTiccmd(ticcmd_t* cmd)
         g_builtLevel = g_level;
     }
     if (!enabled)
+    {
+        SetBikeGod(player, 0);   // free mode: no god mode from the bike
         return;
+    }
 
     if (player->playerstate == PST_DEAD)
     {
@@ -2858,7 +3199,18 @@ void RIDE_BuildTiccmd(ticcmd_t* cmd)
         g_bossUnseen = 0;
     else
         g_bossUnseen++;
-    g_fighting = boss && (g_bossUnseen == 0 || (wasFighting && g_bossUnseen < BOSS_UNSEEN_TICS));
+    int fight = boss && (g_bossUnseen == 0 || (wasFighting && g_bossUnseen < BOSS_UNSEEN_TICS));
+    // Health low in the fight: now and then look for a health item, and break off to fetch it
+    // (still dodging, and shooting at the boss while it is in sight). The fight picks up again
+    // once it is picked up or given up.
+    if (fight && g_objKind != OBJ_HEALTH && HealthLow(mo) && gametic >= g_healthCheckTic)
+    {
+        g_healthCheckTic = gametic + HEALTH_RECHECK;
+        RebuildGridIfStale();
+        if (PlanHealth(mo))
+            LOGI("Ride: breaking off the boss fight for health");
+    }
+    g_fighting = fight && g_objKind != OBJ_HEALTH;
     if (g_fighting != wasFighting)
         LOGI("Ride: %s", g_fighting ? "fighting the boss" : "not fighting");
 
@@ -2870,18 +3222,47 @@ void RIDE_BuildTiccmd(ticcmd_t* cmd)
         g_routeState = ROUTE_NONE;   // plan afresh after the fight
     else if (!holding)
     {
+        // Rode onto damaging floor (or the suit is running out on it): look now and then for a
+        // radiation suit near enough to be worth the trip, without waiting for the next plan. Not
+        // on a detour: that is getting unstuck, and plans again when it ends.
+        if (g_routeState == ROUTE_OK && g_objKind != OBJ_SUIT && g_objKind != OBJ_DETOUR &&
+            gametic >= g_suitCheckTic && SuitWanted(mo))
+        {
+            g_suitCheckTic = gametic + SUIT_RECHECK;
+            PlanSuit(mo);
+        }
+        // Health low: look now and then for a health item. With none to be had, plan the tour
+        // again once, so it heads out if an exit can be reached.
+        if (!HealthLow(mo))
+            g_lowHealthReplanned = 0;
+        else if (g_routeState == ROUTE_OK && !IsPickup(g_objKind) && g_objKind != OBJ_DETOUR &&
+                 gametic >= g_healthCheckTic)
+        {
+            g_healthCheckTic = gametic + HEALTH_RECHECK;
+            if (!PlanHealth(mo) && !g_lowHealthReplanned && !boss &&
+                (g_objKind == OBJ_KEY || g_objKind == OBJ_LINE))
+            {
+                g_lowHealthReplanned = 1;
+                g_routeState = ROUTE_NONE;
+            }
+        }
         if (g_routeState == ROUTE_NONE)
         {
             if (boss)
             {
                 RebuildGridIfStale();
-                MarkBossSpots();   // head for where the bosses are now
-                PlanRoute(mo, CF_BOSS);
-                g_objKind = OBJ_BOSS;
-                // No way to the bosses yet (E1M8 starts behind a switch): tour for keys and
-                // switches, and try the bosses again after each one.
-                if (g_routeState != ROUTE_OK)
-                    PlanTour(mo);
+                if (!PlanSuit(mo) && !PlanHealth(mo))
+                {
+                    if (IsPickup(g_objKind))
+                        EndPickup();
+                    MarkBossSpots();   // head for where the bosses are now
+                    PlanRoute(mo, CF_BOSS);
+                    g_objKind = OBJ_BOSS;
+                    // No way to the bosses yet (E1M8 starts behind a switch): tour for keys and
+                    // switches, and try the bosses again after each one.
+                    if (g_routeState != ROUTE_OK)
+                        PlanTour(mo);
+                }
             }
             else
                 PlanTour(mo);
@@ -3021,13 +3402,16 @@ void RIDE_BuildTiccmd(ticcmd_t* cmd)
         float mx = going ? finecosine[fine] / (float)FRACUNIT : 0, my = going ? finesine[fine] / (float)FRACUNIT : 0;
         float dx, dy, score;
         int shots = ShotDodge(mo, finecosine[fine] / (float)FRACUNIT, finesine[fine] / (float)FRACUNIT, &dx, &dy);
-        if (shots)
+        // Riding on a boss level (to the bosses, for health, to the end): keep clear of a boss
+        // close enough to claw.
+        int near = boss ? BossRepel(mo, BOSS_CLAW, &dx, &dy) : 0;
+        if (shots || near)
         {
             angle_t dodge = ClearHeading(mo, mx + dx, my + dy, &score);
             if (score > -2)
             {
                 if (!g_dodging)
-                    LOGI("Ride: dodging (%d threat%s)", shots, shots > 1 ? "s" : "");
+                    LOGI("Ride: %s", shots ? "dodging" : "keeping clear of the boss");
                 moveAngle = dodge;
                 dodging = 1;
             }
@@ -3143,7 +3527,7 @@ void RIDE_BuildTiccmd(ticcmd_t* cmd)
                 g_objColor = g_savedColor;
             }
             int abandoned = 0;
-            if (++g_objStucks >= 3 && (g_objKind == OBJ_KEY || g_objKind == OBJ_LINE))
+            if (++g_objStucks >= 3 && (g_objKind == OBJ_KEY || g_objKind == OBJ_LINE || IsPickup(g_objKind)))
             {
                 AbandonObjective("stuck on the way");
                 abandoned = 1;
