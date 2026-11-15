@@ -96,6 +96,8 @@ extern int viewwindowx, viewwindowy;
 #define BOSS_UNSEEN_TICS (3*TICRATE) // keep fighting this long after losing sight of it
 #define BOSS_KEEP_MIN   320.0f  // circle a boss between these distances
 #define BOSS_KEEP_MAX   640.0f
+#define BOSS_OPEN       1.5f    // while fighting, how much room ahead counts against the wanted heading
+#define BOSS_CLAW       160.0f  // a boss this close can soon claw: get away from it before anything else
 #define DODGE_TICS      40      // react to a shot arriving within this many tics
 #define DODGE_RADIUS    80.0f   // ... that would pass this close
 #define MPS_PER_RPM     0.042f  // the bike library's cadence-to-pace mapping (CadencePace)
@@ -2608,13 +2610,25 @@ static int TurnTowards(angle_t current, angle_t wanted, int maxTurn)
 
 // Of 16 headings clear of walls for 48 units, the one nearest the wanted direction (wx, wy).
 // *score: the cosine between them, or -2 if every way is blocked.
+static angle_t ClearHeadingOpen(mobj_t* mo, float wx, float wy, float open, float* score);
+
 static angle_t ClearHeading(mobj_t* mo, float wx, float wy, float* score)
+{
+    return ClearHeadingOpen(mo, wx, wy, 0, score);
+}
+
+#define OPEN_RUN        256.0f  // how far ahead ClearHeadingOpen looks for room to keep moving
+
+// ClearHeading, also favouring headings with room to keep going (weighted by `open`), so a rider
+// circling a boss doesn't steer into a dead-end corner and get pinned there. *score is how well
+// the heading matches (wx, wy) alone.
+static angle_t ClearHeadingOpen(mobj_t* mo, float wx, float wy, float open, float* score)
 {
     float px = mo->x / (float)FRACUNIT, py = mo->y / (float)FRACUNIT;
     float len = sqrtf(wx * wx + wy * wy);
     int here = CellAt(px, py);
     int onHazard = here >= 0 && (g_cellFlags[here] & CF_HAZARD);
-    float bestScore = -2;
+    float bestScore = -2, bestValue = -1e9f;
     float bestX = wx, bestY = wy;
     for (int k = 0; k < 16; k++)
     {
@@ -2631,7 +2645,15 @@ static angle_t ClearHeading(mobj_t* mo, float wx, float wy, float* score)
         if (hazard)
             continue;
         float s = len > 0 ? (hx * wx + hy * wy) / len : 0;
-        if (s > bestScore) { bestScore = s; bestX = hx; bestY = hy; }
+        float value = s;
+        if (open > 0)
+        {
+            float run = 48;
+            while (run < OPEN_RUN && ClearPath(px + hx * run, py + hy * run, px + hx * (run + 32), py + hy * (run + 32)))
+                run += 32;
+            value += open * run / OPEN_RUN;
+        }
+        if (value > bestValue) { bestValue = value; bestScore = s; bestX = hx; bestY = hy; }
     }
     *score = bestScore;
     return R_PointToAngle2(mo->x, mo->y, mo->x + (fixed_t)(bestX * 64 * FRACUNIT), mo->y + (fixed_t)(bestY * 64 * FRACUNIT));
@@ -2744,6 +2766,33 @@ static int ShotDodge(mobj_t* mo, float moveX, float moveY, float* outX, float* o
     return n;
 }
 
+// Away from every boss nearer than `range` (not just the one being fought: on E1M8 the other
+// baron walks up while the rider circles the first), most urgently from one close enough to claw.
+// Adds a push to (*wx, *wy); returns how many bosses are that near.
+static int BossRepel(mobj_t* mo, float range, float* wx, float* wy)
+{
+    int n = 0;
+    float px = mo->x / (float)FRACUNIT, py = mo->y / (float)FRACUNIT;
+    for (thinker_t* th = thinkercap.next; th != &thinkercap; th = th->next)
+    {
+        if (th->function.acp1 != (actionf_p1)P_MobjThinker || !IsBoss((mobj_t*)th))
+            continue;
+        mobj_t* m = (mobj_t*)th;
+        float ax = px - m->x / (float)FRACUNIT, ay = py - m->y / (float)FRACUNIT;
+        float d = sqrtf(ax * ax + ay * ay);
+        if (d >= range)
+            continue;
+        if (d < 1) d = 1;
+        float push = 1.5f * (range - d) / range + 0.5f;
+        if (d < BOSS_CLAW)
+            push += 3.0f * (BOSS_CLAW - d) / BOSS_CLAW + 1.0f;
+        *wx += ax / d * push;
+        *wy += ay / d * push;
+        n++;
+    }
+    return n;
+}
+
 // The way to move while fighting a boss: circle it between BOSS_KEEP_MIN and BOSS_KEEP_MAX,
 // sidestep shots heading our way, and only ever take a heading that is clear of walls.
 static angle_t BossSteer(mobj_t* mo, mobj_t* boss)
@@ -2755,15 +2804,16 @@ static angle_t BossSteer(mobj_t* mo, mobj_t* boss)
     ax /= d;
     ay /= d;                                  // unit vector away from the boss
 
-    // Round the boss, pulled back into the band if too close or too far.
+    // Round the boss, pulled back into the band if too far; pushed away from it, and from any
+    // other boss, if too close.
     float wx = -ay * g_orbit, wy = ax * g_orbit;
-    float radial = 0;
-    if (d < BOSS_KEEP_MIN)
-        radial = 1.5f * (BOSS_KEEP_MIN - d) / BOSS_KEEP_MIN + 0.5f;
-    else if (d > BOSS_KEEP_MAX)
-        radial = -fminf(1.5f, (d - BOSS_KEEP_MAX) / 200.0f + 0.3f);
-    wx += ax * radial;
-    wy += ay * radial;
+    if (d > BOSS_KEEP_MAX)
+    {
+        float radial = -fminf(1.5f, (d - BOSS_KEEP_MAX) / 200.0f + 0.3f);
+        wx += ax * radial;
+        wy += ay * radial;
+    }
+    BossRepel(mo, BOSS_KEEP_MIN, &wx, &wy);
 
     // Dodge: for each shot, where will it pass closest to us, and when?
     for (thinker_t* th = thinkercap.next; th != &thinkercap; th = th->next)
@@ -2798,7 +2848,7 @@ static angle_t BossSteer(mobj_t* mo, mobj_t* boss)
     }
 
     float bestScore;
-    angle_t heading = ClearHeading(mo, wx, wy, &bestScore);
+    angle_t heading = ClearHeadingOpen(mo, wx, wy, BOSS_OPEN, &bestScore);
 
     // Boxed in on this side: go round the other way.
     if (bestScore < 0.2f)
@@ -3115,7 +3165,18 @@ void RIDE_BuildTiccmd(ticcmd_t* cmd)
         g_bossUnseen = 0;
     else
         g_bossUnseen++;
-    g_fighting = boss && (g_bossUnseen == 0 || (wasFighting && g_bossUnseen < BOSS_UNSEEN_TICS));
+    int fight = boss && (g_bossUnseen == 0 || (wasFighting && g_bossUnseen < BOSS_UNSEEN_TICS));
+    // Health low in the fight: now and then look for a health item, and break off to fetch it
+    // (still dodging, and shooting at the boss while it is in sight). The fight picks up again
+    // once it is picked up or given up.
+    if (fight && g_objKind != OBJ_HEALTH && HealthLow(mo) && gametic >= g_healthCheckTic)
+    {
+        g_healthCheckTic = gametic + HEALTH_RECHECK;
+        RebuildGridIfStale();
+        if (PlanHealth(mo))
+            LOGI("Ride: breaking off the boss fight for health");
+    }
+    g_fighting = fight && g_objKind != OBJ_HEALTH;
     if (g_fighting != wasFighting)
         LOGI("Ride: %s", g_fighting ? "fighting the boss" : "not fighting");
 
@@ -3307,13 +3368,16 @@ void RIDE_BuildTiccmd(ticcmd_t* cmd)
         float mx = going ? finecosine[fine] / (float)FRACUNIT : 0, my = going ? finesine[fine] / (float)FRACUNIT : 0;
         float dx, dy, score;
         int shots = ShotDodge(mo, finecosine[fine] / (float)FRACUNIT, finesine[fine] / (float)FRACUNIT, &dx, &dy);
-        if (shots)
+        // Riding on a boss level (to the bosses, for health, to the end): keep clear of a boss
+        // close enough to claw.
+        int near = boss ? BossRepel(mo, BOSS_CLAW, &dx, &dy) : 0;
+        if (shots || near)
         {
             angle_t dodge = ClearHeading(mo, mx + dx, my + dy, &score);
             if (score > -2)
             {
                 if (!g_dodging)
-                    LOGI("Ride: dodging (%d threat%s)", shots, shots > 1 ? "s" : "");
+                    LOGI("Ride: %s", shots ? "dodging" : "keeping clear of the boss");
                 moveAngle = dodge;
                 dodging = 1;
             }
